@@ -1,4 +1,4 @@
-# Sample CloudFormation Deployment Cost Reporting
+# CloudFormation Deployment Cost Reporting
 
 Repository: [aws-samples/sample-cloudformation-deployment-cost-reporting](https://github.com/aws-samples/sample-cloudformation-deployment-cost-reporting)
 
