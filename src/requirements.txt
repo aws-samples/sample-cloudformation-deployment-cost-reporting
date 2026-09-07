@@ -1,0 +1,15 @@
+# Bundled into the Lambda package by SAM.
+#
+# PyYAML is NOT part of the Lambda Python runtime, and the template resolver
+# cannot parse a CloudFormation YAML template without it. Omitting this line
+# produces a cold-start ImportError, not a degraded mode.
+#
+# Pinned rather than ranged so a rebuilt package prices identically to the one
+# that was tested. PyYAML's intrinsic-tag handling is what the resolver's custom
+# loader hooks into, so a silent minor bump is not something to inherit blind.
+pyyaml==6.0.3
+
+# boto3 and botocore are provided by the runtime and are deliberately not pinned
+# here. Bundling them adds ~15 MB and pins the SDK to whatever was current at
+# build time, which ages worse than the runtime's own copy. Nothing in this
+# codebase depends on a boto3 feature newer than the runtime's baseline.

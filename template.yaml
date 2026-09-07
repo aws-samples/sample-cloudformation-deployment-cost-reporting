@@ -1,0 +1,891 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  CloudFormation Cost Delta Plugin. Reports the monthly cost of resources added,
+  removed, and resized by each CloudFormation deployment. The plugin cannot
+  mutate monitored CloudFormation stacks or customer resources.
+
+# ---------------------------------------------------------------------------
+# Console grouping. Without this, eighteen parameters render as one flat list
+# and the settings that require an operator decision are buried among defaults.
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Notifications"}
+        Parameters: [NotificationEmail, SesSenderEmail, SesIdentityArn, NotifyThreshold]
+      - Label: {default: "Pricing"}
+        Parameters: [DiscountPercent, EnablePlatformLookup, PriceSyncSchedule, SyncRegions]
+      - Label: {default: "Slack (optional)"}
+        Parameters: [SlackSecretArn, SlackChannelId]
+      - Label: {default: "Stack handling"}
+        Parameters: [NestedStackHandling, MaxNestedDepth, SnapshotRetentionDays, EnablePreDeployEstimate]
+      - Label: {default: "Fan-out (optional)"}
+        Parameters: [DestinationType, CentralBusArn]
+      - Label: {default: "Operations"}
+        Parameters: [LogLevel, EnableMetrics]
+    ParameterLabels:
+      NotificationEmail: {default: "Email address for cost reports"}
+      DiscountPercent: {default: "Discount off list price (%)"}
+
+Parameters:
+  # -- Notifications --------------------------------------------------------
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      Recipient for cost reports and operational alarms. With SesSenderEmail
+      blank, SNS sends plain-text email and requires subscription confirmation.
+      With SesSenderEmail set, SES sends HTML plus text and no SNS report
+      subscription is created. Leave blank to disable email.
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be blank or a valid email address.
+
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      From address for formatted HTML reports. Set this with NotificationEmail to
+      select SES delivery instead of direct plain-text SNS email. Verify either
+      this exact address or its parent domain in SES in this Region. While the
+      account is in the SES sandbox, the recipient must also be verified.
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be blank or a valid email address.
+
+  SesIdentityArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional ARN of the verified SES email or domain identity authorizing the
+      sender. Required for domain-identity deployments. Blank derives the exact
+      email-identity ARN from SesSenderEmail.
+    AllowedPattern: "^$|^arn:[^:]+:ses:[^:]+:[0-9]{12}:identity/.+$"
+    ConstraintDescription: Must be blank or an SES identity ARN.
+
+  NotifyThreshold:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Suppress reports whose absolute net monthly change is below this dollar
+      amount. 0 reports every deployment. Baselines and reconciliation failures
+      are always reported regardless of this setting.
+
+  # -- Pricing --------------------------------------------------------------
+  DiscountPercent:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+    Description: >-
+      Flat percentage off public On-Demand list price, applied uniformly. This is
+      an approximation: it cannot represent Savings Plans, Reserved Instances, or
+      tiered agreements. Every report states the factor that was used. Leave at 0
+      to report list price.
+
+  EnablePlatformLookup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Resolve EC2 operating system by reading the AMI instead of assuming Linux.
+      Adds ec2:DescribeImages. With this off, Windows and RHEL instances are
+      priced as Linux and the report says so.
+
+  PriceSyncSchedule:
+    Type: String
+    Default: "rate(7 days)"
+    Description: >-
+      How often a new immutable price generation is built. Installation performs
+      an initial synchronous bootstrap before event rules are enabled; later
+      healthy generations are atomically activated on this schedule.
+
+  SyncRegions:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated regions to cache prices for. Blank means this stack's own
+      region. Set this only if you price resources in regions other than where
+      the plugin is installed.
+
+  # -- Slack ----------------------------------------------------------------
+  SlackSecretArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Secrets Manager ARN holding a Slack bot token, either as a bare string or
+      as JSON with a "token" field. Blank disables Slack entirely.
+
+  SlackChannelId:
+    Type: String
+    Default: ""
+    Description: >-
+      Slack channel ID (for example C01234ABCDE), not the display name. Both
+      this and SlackSecretArn are required for Slack to activate.
+
+  # -- Stack handling -------------------------------------------------------
+  NestedStackHandling:
+    Type: String
+    Default: ROLLUP
+    AllowedValues: [ROLLUP, SEPARATE]
+    Description: >-
+      ROLLUP aggregates nested stacks into one report at the root, so a parent
+      deployment produces a single figure. SEPARATE reports each nested stack on
+      its own, which is noisier but attributes cost per template.
+
+  MaxNestedDepth:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: >-
+      Depth limit when walking nested stacks. Resources below the limit are
+      listed as unpriced rather than dropped, so the coverage line still
+      accounts for them.
+
+  SnapshotRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: >-
+      How long a deleted stack's snapshot is kept before DynamoDB expires it.
+      This preserves context for late or out-of-order terminal events; a stack
+      recreated with the same name has a new stack ID and starts a new baseline.
+
+  EnablePreDeployEstimate:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Path B. Produces an estimate from a change set before the deployment runs,
+      driven by CloudTrail. Requires a trail capturing management events in this
+      region; the install check reports whether one exists.
+
+  # -- Fan-out --------------------------------------------------------------
+  DestinationType:
+    Type: String
+    Default: LOCAL_SNS
+    AllowedValues: [LOCAL_SNS, CENTRAL_BUS]
+    Description: >-
+      LOCAL_SNS publishes to a topic in this account. CENTRAL_BUS also forwards
+      to an EventBridge bus in a tooling account, which is how a multi-account
+      rollout keeps one Slack integration and one dashboard.
+
+  CentralBusArn:
+    Type: String
+    Default: ""
+    Description: EventBridge bus ARN in the tooling account. Required when DestinationType is CENTRAL_BUS.
+
+  # -- Operations -----------------------------------------------------------
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: DEBUG logs every skipped event and pricing decision. Verbose but the fastest way to answer "why was this resource not priced".
+
+  EnableMetrics:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Publish CloudWatch metrics. These are what makes coverage regressions and reconciliation failures alarmable.
+
+Rules:
+  CentralBusRequiresArn:
+    RuleCondition: !Equals [!Ref DestinationType, CENTRAL_BUS]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CentralBusArn, ""]]
+        AssertDescription: CentralBusArn is required when DestinationType is CENTRAL_BUS.
+
+  SlackSettingsArePaired:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref SlackSecretArn, ""]
+            - !Equals [!Ref SlackChannelId, ""]
+          - !And
+            - !Not [!Equals [!Ref SlackSecretArn, ""]]
+            - !Not [!Equals [!Ref SlackChannelId, ""]]
+        AssertDescription: SlackSecretArn and SlackChannelId must be set together.
+
+  SesIdentityRequiresSender:
+    RuleCondition: !Not [!Equals [!Ref SesIdentityArn, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SesSenderEmail, ""]]
+        AssertDescription: SesSenderEmail is required when SesIdentityArn is set.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  # SES delivers the formatted HTML email. It needs both a verified sender and a
+  # recipient; with either blank the plugin falls back to the plain SNS email.
+  SesEnabled: !And
+    - !Not [!Equals [!Ref SesSenderEmail, ""]]
+    - !Not [!Equals [!Ref NotificationEmail, ""]]
+  HasSesIdentityArn: !Not [!Equals [!Ref SesIdentityArn, ""]]
+  # The plain SNS email subscription is used only when an email is wanted and SES
+  # is not handling it, so an operator never gets both a plain and an HTML copy.
+  PlainEmail: !And
+    - !Condition HasEmail
+    - !Not [!Condition SesEnabled]
+  HasSlack: !And
+    - !Not [!Equals [!Ref SlackSecretArn, ""]]
+    - !Not [!Equals [!Ref SlackChannelId, ""]]
+  UseCentralBus: !And
+    - !Equals [!Ref DestinationType, CENTRAL_BUS]
+    - !Not [!Equals [!Ref CentralBusArn, ""]]
+  EnablePathB: !Equals [!Ref EnablePreDeployEstimate, "true"]
+  HasPlatformLookup: !Equals [!Ref EnablePlatformLookup, "true"]
+  MetricsEnabled: !Equals [!Ref EnableMetrics, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 512
+    Timeout: 300
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_SERVICE_NAME: cfn-cost-delta
+
+Resources:
+
+  # =========================================================================
+  # Storage
+  #
+  # Every table is keyed on a single partition key `pk` and holds no sort key,
+  # because every access is a point read by identifier. On-demand billing is
+  # used throughout: load is driven by how often people deploy, which is bursty
+  # and impossible to provision sensibly.
+  # =========================================================================
+
+  PriceTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+      # Immutable generations are retained. The active generation never expires
+      # underneath persistent metadata; controlled cleanup can remove older
+      # generations after a later operational retention policy is introduced.
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    # Deleted with the stack, so uninstalling really does leave nothing behind.
+    #
+    # The alternative was Retain, to preserve snapshot history. It was rejected:
+    # this table holds derived data, and the entire cost of losing it is that
+    # each stack reports one baseline instead of one delta on its next
+    # deployment. That self-heals. An orphaned table that outlives the uninstall
+    # does not.
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # PROCESSING rows carry a short takeover lease; COMPLETED rows are retained
+      # for 15 days to cover the queue's full delivery/redrive horizon.
+
+  SlackMessageTable:
+    Type: AWS::DynamoDB::Table
+    Condition: HasSlack
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # Holds the estimate's message timestamp so the confirmed report can edit
+      # it rather than posting a second message. Losing a row costs one extra
+      # Slack post, so a short TTL is safe.
+
+  # =========================================================================
+  # Queue
+  #
+  # EventBridge delivers to SQS rather than invoking the Lambda directly, for
+  # three reasons: a burst of stack events is absorbed rather than throttling
+  # concurrency, a failed analysis is retried without the event being lost, and
+  # a message that fails repeatedly lands somewhere inspectable.
+  # =========================================================================
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      # Must be at least the function timeout or Lambda refuses the event source
+      # mapping. The margin above 300s also gives the change-set retry path its
+      # wait, so a change set that is still computing is retried later instead of
+      # the Lambda billing for a sleep.
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600  # 14 days, the maximum
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventDeadLetterQueue.Arn
+        # Path B can legitimately need several readiness polls before a change
+        # set becomes usable; expected retries must not exhaust the budget.
+        maxReceiveCount: 10
+
+  EventDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  DeliveryDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      # Holds Slack/SES asynchronous invocations that still failed after Lambda
+      # retries, preserving the original SNS payload for diagnosis/replay.
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventQueue.Arn
+            # Scoped to this account's rules so the queue cannot be used as a
+            # drop box by an unrelated account's EventBridge.
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  # =========================================================================
+  # Triggers
+  # =========================================================================
+
+  # Path A. Authoritative. Only the five terminal statuses are matched, so a
+  # mid-deployment read is impossible at the rule level. The parser repeats the
+  # check, because a hand-edited rule should not be able to cause one.
+  StackEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: PriceBootstrap
+    Properties:
+      Description: CloudFormation stack reached a terminal status
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudformation]
+        detail-type: [CloudFormation Stack Status Change]
+        detail:
+          status-details:
+            status:
+              - CREATE_COMPLETE
+              - UPDATE_COMPLETE
+              - DELETE_COMPLETE
+              - UPDATE_ROLLBACK_COMPLETE
+              - ROLLBACK_COMPLETE
+      Targets:
+        - Id: EventQueue
+          Arn: !GetAtt EventQueue.Arn
+
+  # Path B. Best-effort. CloudFormation emits no native change set event, so the
+  # CloudTrail record of the API call is matched instead.
+  #
+  # Only CreateChangeSet. ExecuteChangeSet is deliberately not matched: the
+  # confirmed report already comes from Path A's terminal status, so matching it
+  # would spend an invocation to reach a parser that discards it.
+  ChangeSetRule:
+    Type: AWS::Events::Rule
+    Condition: EnablePathB
+    DependsOn: PriceBootstrap
+    Properties:
+      Description: Change set created (pre-deploy estimate, requires a CloudTrail trail)
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudformation]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [cloudformation.amazonaws.com]
+          eventName: [CreateChangeSet]
+      Targets:
+        - Id: EventQueue
+          Arn: !GetAtt EventQueue.Arn
+
+  # =========================================================================
+  # Destinations
+  # =========================================================================
+
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: CFN Cost Delta
+      KmsMasterKeyId: alias/aws/sns
+      # The analyzer publishes once, here. Email, Slack, and anything added later
+      # are subscribers, so a new destination never means touching the analyzer.
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: CFN Cost Delta Operations
+      # Deliberately unencrypted in the sample: CloudWatch alarms cannot use the
+      # default alias/aws/sns key policy. Production encryption requires a CMK
+      # granting cloudwatch.amazonaws.com GenerateDataKey and Decrypt.
+      # Operational alarms have a different schema from cost reports. Keeping
+      # them separate prevents an alarm from rendering as an unknown $0 report.
+
+  # Plain-text report and alarm subscriptions are used only when SES is not
+  # configured. Each subscription requires its own SNS confirmation.
+  ReportEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: PlainEmail
+    Properties:
+      TopicArn: !Ref ReportTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: PlainEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =========================================================================
+  # Functions
+  # =========================================================================
+
+  AnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: runtime.handlers.analyzer_handler
+      Description: Prices the resources a CloudFormation deployment added, removed, or resized
+      # Nested rollup on a large stack means many template reads and price
+      # lookups; the memory is for the resolved-resource graph, not for CPU.
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          PRICE_TABLE: !Ref PriceTable
+          STATE_TABLE: !Ref StateTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          # Exact deployment stack ARN, used to suppress reports about the
+          # plugin installing or updating itself. AWS::StackId is not a name or
+          # prefix, so similarly named customer stacks remain eligible.
+          PLUGIN_STACK_ID: !Ref AWS::StackId
+          TOPIC_ARN: !Ref ReportTopic
+          CENTRAL_BUS_ARN: !If [UseCentralBus, !Ref CentralBusArn, ""]
+          DISCOUNT_PERCENT: !Ref DiscountPercent
+          ENABLE_PLATFORM_LOOKUP: !Ref EnablePlatformLookup
+          NOTIFY_THRESHOLD: !Ref NotifyThreshold
+          NESTED_STACK_HANDLING: !Ref NestedStackHandling
+          MAX_NESTED_DEPTH: !Ref MaxNestedDepth
+          SNAPSHOT_RETENTION_DAYS: !Ref SnapshotRetentionDays
+          ENABLE_METRICS: !Ref EnableMetrics
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventQueue.Arn
+            BatchSize: 10
+            # Without this, one unparseable message forces the other nine to be
+            # reprocessed and eventually sends all ten to the dead-letter queue.
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - Statement:
+            # Every monitored stack in this account and Region is covered while
+            # excluding unrelated CloudFormation resource types.
+            - Sid: ReadCloudFormation
+              Effect: Allow
+              Action:
+                - cloudformation:DescribeStacks
+                - cloudformation:GetTemplate
+                - cloudformation:ListStackResources
+                - cloudformation:DescribeChangeSet
+              Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*/*"
+        - Statement:
+            - Sid: ReadPriceCache
+              Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt PriceTable.Arn
+        - Statement:
+            # DeleteItem is required: a deleted stack's snapshot is retired, and
+            # a failed analysis releases its idempotency claim so a retry can
+            # take it.
+            - Sid: ReadWriteOwnState
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource:
+                - !GetAtt StateTable.Arn
+                - !GetAtt IdempotencyTable.Arn
+        - Statement:
+            - Sid: PublishReport
+              Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref ReportTopic
+        - !If
+          - UseCentralBus
+          - Statement:
+              - Sid: ForwardToCentralBus
+                Effect: Allow
+                Action: [events:PutEvents]
+                Resource: !Ref CentralBusArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasPlatformLookup
+          - Statement:
+              # The only permission beyond CloudFormation and pricing, and it is
+              # opt-in. Without it the plugin still works and reports that it
+              # assumed Linux.
+              - Sid: ResolveAmiPlatform
+                Effect: Allow
+                Action: [ec2:DescribeImages]
+                Resource: "*"
+          - !Ref AWS::NoValue
+        - Statement:
+            - Sid: PublishMetrics
+              Effect: Allow
+              Action: [cloudwatch:PutMetricData]
+              Resource: "*"
+              # PutMetricData has no resource-level permission, so the namespace
+              # condition is what actually constrains it.
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: CFNCostPlugin
+
+  PriceSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: runtime.handlers.price_sync_handler
+      Description: Refreshes the price cache on a schedule, never in the request path
+      # The Price List API returns large paginated result sets that are filtered
+      # in memory, which is the whole memory and time budget here.
+      MemorySize: 1024
+      Timeout: 900
+      Environment:
+        Variables:
+          PRICE_TABLE: !Ref PriceTable
+          SYNC_REGIONS: !Ref SyncRegions
+      Events:
+        PriceRefresh:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref PriceSyncSchedule
+            Description: Refresh the CFN cost plugin price cache
+      Policies:
+        - Statement:
+            - Sid: ReadPublicPrices
+              Effect: Allow
+              Action: [pricing:GetProducts]
+              Resource: "*"
+        - Statement:
+            # BatchWriteItem is required: the sync writes through a batch writer
+            # rather than one put per price record.
+            - Sid: WritePriceCache
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt PriceTable.Arn
+
+  PriceBootstrap:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PriceSyncFunction.Arn
+      SyncRegions: !Ref SyncRegions
+      Schedule: !Ref PriceSyncSchedule
+      # Guarantees a healthy generation exists before stack-event rules are
+      # enabled, so the first customer deployment is never priced against an
+      # empty cache.
+
+  SlackFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasSlack
+    Properties:
+      CodeUri: src/
+      Handler: runtime.handlers.slack_handler
+      Description: Renders cost reports into Slack
+      MemorySize: 256
+      Timeout: 60
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeliveryDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          SLACK_SECRET_ARN: !Ref SlackSecretArn
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+          SLACK_MESSAGE_TABLE: !Ref SlackMessageTable
+      Events:
+        Report:
+          Type: SNS
+          Properties:
+            Topic: !Ref ReportTopic
+      Policies:
+        - Statement:
+            - Sid: ReadSlackToken
+              Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Ref SlackSecretArn
+        - Statement:
+            - Sid: TrackSlackMessages
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt SlackMessageTable.Arn
+        - Statement:
+            - Sid: SendFailedDeliveryToDlq
+              Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource: !GetAtt DeliveryDeadLetterQueue.Arn
+
+  # SNS email is plain text only. This subscriber renders the same report the
+  # analyzer already published into a formatted HTML email and sends it through
+  # SES. Like Slack, it is a subscriber to the one report topic, so the analyzer
+  # is untouched. Only created when a sender and recipient are both set.
+  EmailReportFunction:
+    Type: AWS::Serverless::Function
+    Condition: SesEnabled
+    Properties:
+      CodeUri: src/
+      Handler: runtime.handlers.email_handler
+      Description: Renders cost reports and operational alarms into HTML email via SES
+      MemorySize: 256
+      Timeout: 60
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeliveryDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          NOTIFICATION_EMAIL: !Ref NotificationEmail
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
+      Events:
+        Report:
+          Type: SNS
+          Properties:
+            Topic: !Ref ReportTopic
+        Alarm:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlarmTopic
+      Policies:
+        - Statement:
+            # Send only, and only as the configured sender. The FromAddress
+            # condition means this cannot be used to send as any other verified
+            # identity in the account, and the resource scopes it to that one
+            # identity — the plugin's send-email footprint is a single address.
+            - Sid: SendReportEmail
+              Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: !If
+                - HasSesIdentityArn
+                - !Ref SesIdentityArn
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesSenderEmail}"
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref SesSenderEmail
+        - Statement:
+            - Sid: SendFailedDeliveryToDlq
+              Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource: !GetAtt DeliveryDeadLetterQueue.Arn
+
+  # =========================================================================
+  # Install-time check
+  #
+  # Path B only fires if a CloudTrail trail is capturing management events in
+  # this region. Nothing in AWS tells you when that is missing: the rule
+  # deploys, matches nothing, and stays quiet. This resource reports the answer
+  # at install time.
+  #
+  # It never fails the deployment. A missing trail should cost you Path B, not
+  # your install.
+  # =========================================================================
+
+  InstallCheckFunction:
+    Type: AWS::Serverless::Function
+    Condition: EnablePathB
+    Properties:
+      CodeUri: src/
+      Handler: runtime.install_check.handler
+      Description: Reports whether a CloudTrail trail exists for the pre-deploy estimate path
+      MemorySize: 256
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Sid: InspectTrails
+              Effect: Allow
+              Action:
+                - cloudtrail:DescribeTrails
+                - cloudtrail:GetEventSelectors
+              Resource: "*"
+
+  InstallCheck:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: EnablePathB
+    Properties:
+      ServiceToken: !GetAtt InstallCheckFunction.Arn
+      # Changing the region forces the check to re-run on a cross-region
+      # redeploy rather than reusing a stale answer.
+      Region: !Ref AWS::Region
+
+  # =========================================================================
+  # Alarms
+  #
+  # Four alarms cover analysis correctness plus both analyzer and subscriber
+  # dead-letter queues. Dollar thresholds remain installer-specific.
+  # =========================================================================
+
+  AnalysisFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MetricsEnabled
+    Properties:
+      AlarmDescription: >-
+        The analyzer could not process an event. The message is retried and then
+        moved to the dead-letter queue, so a sustained value here means reports
+        are being missed.
+      Namespace: CFNCostPlugin
+      MetricName: AnalysisFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ReconciliationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MetricsEnabled
+    Properties:
+      AlarmDescription: >-
+        A report failed its own arithmetic check, meaning the diff lost or
+        double-counted a resource. This should never be non-zero; if it is, the
+        numbers in that report cannot be trusted.
+      Namespace: CFNCostPlugin
+      MetricName: ReconciliationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Analyzer events exhausted their retry budget without a report.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DeliveryDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Slack or SES delivery failed after Lambda asynchronous retries.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeliveryDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  ReportTopicArn:
+    Description: Canonical cost reports; analyzer publishes once and subscribers fan out.
+    Value: !Ref ReportTopic
+
+  AlarmTopicArn:
+    Description: Native operational alarms, kept separate from cost-report JSON.
+    Value: !Ref AlarmTopic
+
+  DeadLetterQueueUrl:
+    Description: Analyzer events that exhausted the retry budget without a report.
+    Value: !Ref EventDeadLetterQueue
+
+  DeliveryDeadLetterQueueUrl:
+    Description: Slack or SES invocations that failed after asynchronous retries.
+    Value: !Ref DeliveryDeadLetterQueue
+
+  StateTableName:
+    Description: >-
+      Stack snapshots. The table is deleted with the plugin stack; rows for
+      deleted monitored stacks expire after SnapshotRetentionDays.
+    Value: !Ref StateTable
+
+  PriceTableName:
+    Description: Atomically activated price generations, bootstrapped at install and refreshed on schedule.
+    Value: !Ref PriceTable
+
+  PriceBootstrapStatus:
+    Description: Initial price-cache generation status.
+    Value: !GetAtt PriceBootstrap.Status
+
+  PreDeployEstimateStatus:
+    Condition: EnablePathB
+    Description: Whether a CloudTrail trail was found for the pre-deploy estimate path at install time.
+    Value: !GetAtt InstallCheck.Status
+
+  MetricsNamespace:
+    Description: CloudWatch namespace for the plugin's own metrics.
+    Value: CFNCostPlugin
